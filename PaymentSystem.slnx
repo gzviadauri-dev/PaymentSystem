@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/LicenseCore.API/LicenseCore.API.csproj" />
+    <Project Path="src/Payment.API/Payment.API.csproj" />
+    <Project Path="src/Payment.Application/Payment.Application.csproj" />
+    <Project Path="src/Payment.Domain/Payment.Domain.csproj" />
+    <Project Path="src/Payment.Infrastructure/Payment.Infrastructure.csproj" />
+    <Project Path="src/Payment.Tests/Payment.Tests.csproj" />
+    <Project Path="src/Shared.Contracts/Shared.Contracts.csproj" />
+  </Folder>
+</Solution>

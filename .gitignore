@@ -1,0 +1,38 @@
+# Build outputs
+bin/
+obj/
+*.user
+
+# Rider / VS / VSCode
+.idea/
+.vs/
+.vscode/
+*.suo
+
+# NuGet
+*.nupkg
+.nuget-local/
+packages/
+
+# Docker / environment secrets
+.env
+.env.*
+!.env.example
+
+# IMPORTANT: Never commit appsettings with real secrets.
+# Use environment variables or a secrets manager (Azure Key Vault, AWS Secrets
+# Manager, HashiCorp Vault) for:
+#   - ConnectionStrings__DefaultConnection (SA password)
+#   - Jwt__Key
+#   - ExternalProviders__WebhookSecret
+# The appsettings.json files in this repo contain DEVELOPMENT DEFAULTS ONLY.
+# appsettings.Production.json must not contain secrets.
+
+# Test results
+TestResults/
+coverage/
+
+# Node
+Web/node_modules/
+Web/dist/
+Web/.next/

@@ -1,0 +1,253 @@
+services:
+
+  # ── Infrastructure ────────────────────────────────────────────────────────
+
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      SA_PASSWORD: "YourStrong!Passw0rd"
+      ACCEPT_EULA: "Y"
+    ports:
+      - "1433:1433"
+    volumes:
+      - sqlserver_data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'YourStrong!Passw0rd' -Q 'SELECT 1' -No || exit 1"]
+      interval: 10s
+      retries: 10
+      start_period: 30s
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    hostname: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+      RABBITMQ_ERLANG_COOKIE: "PAYMENT-SYSTEM-LOCAL-COOKIE"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      retries: 5
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Observability stack ───────────────────────────────────────────────────
+
+  graylog:
+    image: graylog/graylog:6.1
+    environment:
+      GRAYLOG_PASSWORD_SECRET: "somepasswordpepper"
+      # echo -n "admin" | sha256sum
+      GRAYLOG_ROOT_PASSWORD_SHA2: "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918"
+      GRAYLOG_HTTP_EXTERNAL_URI: "http://localhost:9000/"
+      GRAYLOG_ELASTICSEARCH_HOSTS: "http://opensearch:9200"
+      GRAYLOG_MONGODB_URI: "mongodb://mongo:27017/graylog"
+    ports:
+      - "9000:9000"
+      - "12201:12201/udp"
+      - "12201:12201/tcp"
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      mongo:
+        condition: service_started
+
+  opensearch:
+    image: opensearchproject/opensearch:2.15.0
+    environment:
+      - discovery.type=single-node
+      - DISABLE_SECURITY_PLUGIN=true
+      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 20s
+      retries: 5
+      start_period: 40s
+
+  mongo:
+    image: mongo:7
+    volumes:
+      - mongo_data:/data/db
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.102.0
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "13133:13133"
+    depends_on:
+      - jaeger
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.58
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4319:4317"
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - otel-collector
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "admin"
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - jaeger
+
+  # ── Migration init containers ─────────────────────────────────────────────
+  # Run migrations as a separate step before the API starts.
+  # Prevents race conditions when multiple API replicas start simultaneously.
+
+  payment-db-migrate:
+    build:
+      context: .
+      dockerfile: src/Payment.API/Dockerfile
+    command: ["dotnet", "Payment.API.dll", "--migrate"]
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    environment:
+      - ConnectionStrings__DefaultConnection=Server=sqlserver,1433;Database=PaymentDb;User Id=sa;Password=YourStrong!Passw0rd;TrustServerCertificate=True;
+      - Jwt__Key=${JWT_KEY:-Paym3nt-Syst3m-JWT-K3y-For-Local-Run!}
+      - Jwt__Issuer=PaymentSystem
+      - Jwt__Audience=PaymentSystemClients
+    restart: "no"
+
+  core-db-migrate:
+    build:
+      context: .
+      dockerfile: src/LicenseCore.API/Dockerfile
+    command: ["dotnet", "LicenseCore.API.dll", "--migrate"]
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    environment:
+      - ConnectionStrings__DefaultConnection=Server=sqlserver,1433;Database=LicenseCoreDb;User Id=sa;Password=YourStrong!Passw0rd;TrustServerCertificate=True;
+      - Jwt__Key=${JWT_KEY:-Paym3nt-Syst3m-JWT-K3y-For-Local-Run!}
+      - Jwt__Issuer=PaymentSystem
+      - Jwt__Audience=PaymentSystemClients
+    restart: "no"
+
+  # ── Application services ──────────────────────────────────────────────────
+
+  payment-api:
+    build:
+      context: .
+      dockerfile: src/Payment.API/Dockerfile
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      payment-db-migrate:
+        condition: service_completed_successfully
+    ports:
+      - "5001:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ConnectionStrings__DefaultConnection=Server=sqlserver,1433;Database=PaymentDb;User Id=sa;Password=YourStrong!Passw0rd;TrustServerCertificate=True;
+      - ConnectionStrings__Redis=${REDIS_CONNECTION:-redis:6379}
+      - Jwt__Key=${JWT_KEY:-Paym3nt-Syst3m-JWT-K3y-For-Local-Run!}
+      - Jwt__Issuer=PaymentSystem
+      - Jwt__Audience=PaymentSystemClients
+      - RabbitMQ__Host=rabbitmq://rabbitmq
+      - Observability__Logging__Graylog__Enabled=true
+      - Observability__Logging__Graylog__Host=graylog
+      - Observability__Logging__Graylog__Protocol=udp
+      - Observability__Logging__SampleSuccessRate=0.1
+      - Observability__Telemetry__Otlp__Enabled=true
+      - Observability__Telemetry__Otlp__Endpoint=http://otel-collector:4317
+      - Observability__Telemetry__Tracing__SamplingRatio=1.0
+      - ExternalProviders__WebhookSecret=${PAYMENT_WEBHOOK_SECRET:-CHANGE-ME-set-in-dotenv}
+
+  core-api:
+    build:
+      context: .
+      dockerfile: src/LicenseCore.API/Dockerfile
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      core-db-migrate:
+        condition: service_completed_successfully
+    ports:
+      - "5002:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ConnectionStrings__DefaultConnection=Server=sqlserver,1433;Database=LicenseCoreDb;User Id=sa;Password=YourStrong!Passw0rd;TrustServerCertificate=True;
+      - ConnectionStrings__Redis=${REDIS_CONNECTION:-redis:6379}
+      - Jwt__Key=${JWT_KEY:-Paym3nt-Syst3m-JWT-K3y-For-Local-Run!}
+      - Jwt__Issuer=PaymentSystem
+      - Jwt__Audience=PaymentSystemClients
+      - RabbitMQ__Host=rabbitmq://rabbitmq
+      - Observability__Logging__Graylog__Enabled=true
+      - Observability__Logging__Graylog__Host=graylog
+      - Observability__Logging__Graylog__Protocol=udp
+      - Observability__Logging__SampleSuccessRate=0.1
+      - Observability__Telemetry__Otlp__Enabled=true
+      - Observability__Telemetry__Otlp__Endpoint=http://otel-collector:4317
+      - Observability__Telemetry__Tracing__SamplingRatio=1.0
+
+  web:
+    build:
+      context: ./Web
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      - payment-api
+      - core-api
+
+volumes:
+  sqlserver_data:
+  rabbitmq_data:
+  redis_data:
+  opensearch_data:
+  mongo_data:
+  prometheus_data:
+  grafana_data:
