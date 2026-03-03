@@ -101,7 +101,7 @@ public class MonthlyDebtGeneratorService : BackgroundService
                     WHERE NOT EXISTS (
                         SELECT 1 FROM MonthlyDebtDispatches
                         WHERE LicenseId = {1} AND Month = {2})",
-                    Guid.NewGuid(), license.Id, thisMonth, DateTime.UtcNow, ct);
+                    new object[] { Guid.NewGuid(), license.Id, thisMonth, DateTime.UtcNow }, ct);
 
                 if (inserted == 0)
                 {

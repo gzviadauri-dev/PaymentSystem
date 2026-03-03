@@ -142,17 +142,11 @@ builder.Services.AddCors(options =>
               .DisallowCredentials()));
 
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection")!;
-var rabbitHost = builder.Configuration["RabbitMQ:Host"] ?? "rabbitmq://localhost";
-var rabbitUri = new Uri(rabbitHost.Replace("rabbitmq://", "amqp://"));
-
-builder.Services.AddSingleton<RabbitMQ.Client.IConnectionFactory>(
-    _ => new RabbitMQ.Client.ConnectionFactory { Uri = rabbitUri, AutomaticRecoveryEnabled = true });
 
 builder.Services.AddSingleton<MassTransitBusHealthCheck>();
 
 builder.Services.AddHealthChecks()
     .AddSqlServer(connectionString, name: "sqlserver", tags: ["db", "ready"])
-    .AddRabbitMQ(name: "rabbitmq", tags: ["messaging", "ready"])
     .AddCheck<MassTransitBusHealthCheck>("masstransit", tags: ["messaging", "ready"]);
 
 var app = builder.Build();

@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { paymentsApi } from '../api/paymentsApi'
 import BalanceWidget from '../components/BalanceWidget'
 import PaymentCard from '../components/PaymentCard'
+import QuickPay from '../components/QuickPay'
 import { useAuthStore } from '../store/authStore'
 
 export default function Dashboard() {
@@ -30,6 +31,8 @@ export default function Dashboard() {
       </div>
 
       {accountId && <BalanceWidget accountId={accountId} />}
+
+      <QuickPay />
 
       {pending.length > 0 && (
         <div className="bg-amber-50 border border-amber-200 rounded-xl p-4">

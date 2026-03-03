@@ -31,6 +31,6 @@ public class OutboxWriter : IOutboxWriter
 
         await _db.Database.ExecuteSqlRawAsync(
             "INSERT INTO OutboxMessages (Id, Type, Payload, CreatedAt, RetryCount) VALUES ({0},{1},{2},{3},0)",
-            Guid.NewGuid(), eventType, json, DateTime.UtcNow, ct);
+            new object[] { Guid.NewGuid(), eventType, json, DateTime.UtcNow }, ct);
     }
 }

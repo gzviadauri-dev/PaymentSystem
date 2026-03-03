@@ -1,6 +1,7 @@
 using System.Data;
 using System.Text;
 using System.Text.Json;
+using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using Payment.Application.Interfaces;
 using Payment.Domain.Entities;
@@ -44,15 +45,20 @@ public class PaymentRepository : IPaymentRepository
               (Id, LicenseId, Amount, Status, Type, ExternalPaymentId, ProviderId,
                TargetId, Month, CreatedAt, PaidAt)
             VALUES ({0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10})",
-            payment.Id, payment.LicenseId, payment.Amount,
-            payment.Status.ToString(), payment.Type.ToString(),
-            (object?)payment.ExternalPaymentId ?? DBNull.Value,
-            (object?)payment.ProviderId ?? DBNull.Value,
-            (object?)payment.TargetId ?? DBNull.Value,
-            (object?)payment.Month ?? DBNull.Value,
-            payment.CreatedAt,
-            (object?)payment.PaidAt ?? DBNull.Value,
-            ct);
+            new object[]
+            {
+                payment.Id,
+                payment.LicenseId,
+                payment.Amount,
+                payment.Status.ToString(),
+                payment.Type.ToString(),
+                new SqlParameter { Value = (object?)payment.ExternalPaymentId ?? DBNull.Value },
+                new SqlParameter { Value = (object?)payment.ProviderId       ?? DBNull.Value },
+                new SqlParameter { Value = (object?)payment.TargetId         ?? DBNull.Value },
+                new SqlParameter { Value = (object?)payment.Month            ?? DBNull.Value },
+                payment.CreatedAt,
+                new SqlParameter { Value = (object?)payment.PaidAt           ?? DBNull.Value },
+            }, ct);
     }
 
     public async Task<Domain.Entities.Payment?> GetByExternalIdAsync(
@@ -105,11 +111,11 @@ public class PaymentRepository : IPaymentRepository
             // All writes via ExecuteSqlRawAsync — never SaveChangesAsync inside a locked transaction
             await _db.Database.ExecuteSqlRawAsync(
                 "UPDATE Balances SET Amount = Amount - {0}, UpdatedAt = {1} WHERE AccountId = {2}",
-                amount, DateTime.UtcNow, accountId, ct);
+                new object[] { amount, DateTime.UtcNow, accountId }, ct);
 
             await _db.Database.ExecuteSqlRawAsync(
                 "UPDATE Payments SET Status = 'Paid', PaidAt = {0} WHERE Id = {1}",
-                DateTime.UtcNow, paymentId, ct);
+                new object[] { DateTime.UtcNow, paymentId }, ct);
 
             await WriteOutboxRawAsync(
                 nameof(PaymentCompletedEvent),
@@ -136,7 +142,7 @@ public class PaymentRepository : IPaymentRepository
                 WHERE ExternalPaymentId = {1}
                   AND ProviderId = {2}
                   AND Status = 'Pending'",
-                paidAt, externalPaymentId, providerId, ct);
+                new object[] { paidAt, externalPaymentId, providerId }, ct);
 
             if (affected == 0)
             {
@@ -170,9 +176,14 @@ public class PaymentRepository : IPaymentRepository
     {
         var rows = await _db.Database.ExecuteSqlRawAsync(
             "UPDATE Payments SET Status = 'Overdue' WHERE Id = {0} AND Status = 'Pending'",
-            paymentId, ct);
+            new object[] { paymentId }, ct);
         return rows > 0;
     }
+
+    public async Task MarkFailedAsync(Guid paymentId, CancellationToken ct = default)
+        => await _db.Database.ExecuteSqlRawAsync(
+            "UPDATE Payments SET Status = 'Failed' WHERE Id = {0}",
+            new object[] { paymentId }, ct);
 
     // Writes an outbox entry via raw SQL so it participates in the current ambient
     // transaction without touching the change tracker.
@@ -187,6 +198,6 @@ public class PaymentRepository : IPaymentRepository
 
         await _db.Database.ExecuteSqlRawAsync(
             "INSERT INTO OutboxMessages (Id, Type, Payload, CreatedAt, RetryCount) VALUES ({0},{1},{2},{3},0)",
-            Guid.NewGuid(), type, json, DateTime.UtcNow, ct);
+            new object[] { Guid.NewGuid(), type, json, DateTime.UtcNow }, ct);
     }
 }

@@ -19,7 +19,7 @@ export interface BalanceResult {
 export interface PaymentDto {
   id: string
   amount: number
-  status: 'Pending' | 'Paid' | 'Overdue' | 'Cancelled'
+  status: 'Pending' | 'Paid' | 'Overdue' | 'Cancelled' | 'Failed'
   type: string
   createdAt: string
   paidAt: string | null
@@ -32,6 +32,13 @@ export interface PayViaBalanceResult {
 
 export interface CreatePaymentResult {
   id: string
+}
+
+export const authApi = {
+  login: (licenseId: string) =>
+    api
+      .post<{ token: string; accountId: string; licenseId: string }>('/auth/login', { licenseId })
+      .then((r) => r.data),
 }
 
 export const balanceApi = {
@@ -89,6 +96,64 @@ export const paymentsApi = {
         headers: { 'Idempotency-Key': idempotencyKey },
       })
       .then((r) => r.data),
+}
+
+async function retryOn409<T>(fn: () => Promise<T>, timeoutMs = 30_000): Promise<T> {
+  const deadline = Date.now() + timeoutMs
+  while (true) {
+    try {
+      return await fn()
+    } catch (err: unknown) {
+      if (
+        typeof err === 'object' &&
+        err !== null &&
+        'response' in err &&
+        (err as { response?: { status?: number } }).response?.status === 409
+      ) {
+        if (Date.now() >= deadline) throw err
+        await new Promise((r) => setTimeout(r, 2000))
+        continue
+      }
+      throw err
+    }
+  }
+}
+
+export interface QuickPayResult {
+  success: boolean
+  reason?: string
+  paymentId?: string
+}
+
+/**
+ * Single-request generate-and-pay: server checks balance first.
+ * If insufficient, creates a Failed payment record and returns the reason.
+ * If sufficient, creates Pending then atomically pays it.
+ */
+export async function generateAndPay(
+  licenseId: string,
+  accountId: string,
+  type: string,
+  amount: number,
+): Promise<QuickPayResult> {
+  const idempotencyKey = crypto.randomUUID()
+  return retryOn409(() =>
+    api
+      .post<QuickPayResult>(
+        '/payments/quick-pay',
+        { licenseId, accountId, type, amount },
+        { headers: { 'Idempotency-Key': idempotencyKey } },
+      )
+      .then((r) => r.data)
+      .catch((err: unknown) => {
+        // 422 = insufficient balance — treat as a known result, not a thrown error
+        const axiosErr = err as { response?: { data?: QuickPayResult; status?: number } }
+        if (axiosErr?.response?.status === 422 && axiosErr.response.data) {
+          return axiosErr.response.data
+        }
+        throw err
+      }),
+  )
 }
 
 export default api

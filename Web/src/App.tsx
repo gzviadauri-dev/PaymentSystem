@@ -1,6 +1,8 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { BrowserRouter, Link, Route, Routes, useLocation } from 'react-router-dom'
+import { BrowserRouter, Link, Navigate, Route, Routes, useLocation } from 'react-router-dom'
+import ToastContainer from './components/ToastContainer'
 import Dashboard from './pages/Dashboard'
+import Login from './pages/Login'
 import Payments from './pages/Payments'
 import TopUp from './pages/TopUp'
 import { useAuthStore } from './store/authStore'
@@ -27,6 +29,8 @@ function NavLink({ to, children }: { to: string; children: React.ReactNode }) {
 function Layout() {
   const { logout, accountId } = useAuthStore()
 
+  if (!accountId) return <Navigate to="/login" replace />
+
   return (
     <div className="min-h-screen bg-gray-50">
       <nav className="bg-white border-b border-gray-200 sticky top-0 z-10">
@@ -37,14 +41,12 @@ function Layout() {
             <NavLink to="/payments">Payments</NavLink>
             <NavLink to="/topup">Top Up</NavLink>
           </div>
-          {accountId && (
-            <button
-              onClick={logout}
-              className="text-xs text-gray-400 hover:text-gray-600 ml-2"
-            >
-              Logout
-            </button>
-          )}
+          <button
+            onClick={logout}
+            className="text-xs text-gray-400 hover:text-gray-600 ml-2"
+          >
+            Logout
+          </button>
         </div>
       </nav>
       <main>
@@ -62,7 +64,11 @@ export default function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <BrowserRouter>
-        <Layout />
+        <Routes>
+          <Route path="/login" element={<Login />} />
+          <Route path="/*" element={<Layout />} />
+        </Routes>
+        <ToastContainer />
       </BrowserRouter>
     </QueryClientProvider>
   )

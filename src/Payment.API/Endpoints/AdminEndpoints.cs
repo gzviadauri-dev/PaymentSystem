@@ -74,14 +74,14 @@ public static class AdminEndpoints
             await db.Database.ExecuteSqlRawAsync(@"
                 INSERT INTO OutboxMessages (Id, Type, Payload, CreatedAt, RetryCount)
                 VALUES ({0},{1},{2},{3},0)",
-                newOutboxId, dead.Type, dead.Payload, now, ct);
+                new object[] { newOutboxId, dead.Type, dead.Payload, now }, ct);
 
             // Mark as Replaying with the new outbox entry's ID
             await db.Database.ExecuteSqlRawAsync(@"
                 UPDATE DeadLetterMessages
                 SET Status = 'Replaying', ReplayedOutboxMessageId = {0}, ReplayedAt = {1}
                 WHERE Id = {2}",
-                newOutboxId, now, id, ct);
+                new object[] { newOutboxId, now, id }, ct);
 
             return Results.Ok(new { replayed = true, newOutboxEntryId = newOutboxId });
         }).WithName("ReplayDeadLetter");

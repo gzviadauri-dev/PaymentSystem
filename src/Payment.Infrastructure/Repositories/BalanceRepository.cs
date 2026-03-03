@@ -31,7 +31,7 @@ public class BalanceRepository : IBalanceRepository
             INSERT INTO Balances (AccountId, Amount, UpdatedAt)
             SELECT {0}, 0, {1}
             WHERE NOT EXISTS (SELECT 1 FROM Balances WHERE AccountId = {0})",
-            accountId, DateTime.UtcNow, ct);
+            new object[] { accountId, DateTime.UtcNow }, ct);
 
         return (await GetByAccountIdAsync(accountId, ct))!;
     }
@@ -71,12 +71,12 @@ public class BalanceRepository : IBalanceRepository
 
             await _db.Database.ExecuteSqlRawAsync(
                 "UPDATE Balances SET Amount = Amount - {0}, UpdatedAt = {1} WHERE AccountId = {2}",
-                amount, DateTime.UtcNow, accountId, ct);
+                new object[] { amount, DateTime.UtcNow, accountId }, ct);
 
             // Secondary WHERE guard: CAS on Status = 'Pending' to catch races after the lock read
             var paymentRows = await _db.Database.ExecuteSqlRawAsync(
                 "UPDATE Payments SET Status = 'Paid', PaidAt = {0} WHERE Id = {1} AND Status = 'Pending'",
-                DateTime.UtcNow, paymentId, ct);
+                new object[] { DateTime.UtcNow, paymentId }, ct);
 
             if (paymentRows == 0)
             {
@@ -89,7 +89,7 @@ public class BalanceRepository : IBalanceRepository
             var outboxJson = JsonSerializer.Serialize(new BalanceDebitedEvent(paymentId, amount));
             await _db.Database.ExecuteSqlRawAsync(
                 "INSERT INTO OutboxMessages (Id, Type, Payload, CreatedAt, RetryCount) VALUES ({0},{1},{2},{3},0)",
-                Guid.NewGuid(), nameof(BalanceDebitedEvent), outboxJson, DateTime.UtcNow, ct);
+                new object[] { Guid.NewGuid(), nameof(BalanceDebitedEvent), outboxJson, DateTime.UtcNow }, ct);
 
             await tx.CommitAsync(ct);
             return new TryDebitAndCompletePaymentResult(TryDebitResult.Success, 0m);
@@ -107,7 +107,7 @@ public class BalanceRepository : IBalanceRepository
         {
             var rows = await _db.Database.ExecuteSqlRawAsync(
                 "UPDATE Balances SET Amount = Amount + {0}, UpdatedAt = {1} WHERE AccountId = {2}",
-                amount, now, accountId, ct);
+                new object[] { amount, now, accountId }, ct);
 
             if (rows > 0)
                 return;
@@ -118,7 +118,7 @@ public class BalanceRepository : IBalanceRepository
                     INSERT INTO Balances (AccountId, Amount, UpdatedAt)
                     SELECT {0}, {1}, {2}
                     WHERE NOT EXISTS (SELECT 1 FROM Balances WHERE AccountId = {0})",
-                    accountId, amount, now, ct);
+                    new object[] { accountId, amount, now }, ct);
                 return;
             }
             catch (DbUpdateException ex)
@@ -132,6 +132,6 @@ public class BalanceRepository : IBalanceRepository
         // Final attempt after exhausting INSERT retries
         await _db.Database.ExecuteSqlRawAsync(
             "UPDATE Balances SET Amount = Amount + {0}, UpdatedAt = {1} WHERE AccountId = {2}",
-            amount, now, accountId, ct);
+            new object[] { amount, now, accountId }, ct);
     }
 }

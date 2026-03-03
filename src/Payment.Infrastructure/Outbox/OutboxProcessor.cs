@@ -63,7 +63,7 @@ public class OutboxProcessor : BackgroundService
             WHERE ProcessedAt IS NULL
               AND RetryCount < 5
               AND (LockedUntil IS NULL OR LockedUntil < {2})",
-            leaseExpiry, InstanceId, now, ct);
+            new object[] { leaseExpiry, InstanceId, now }, ct);
 
         // Step 2: Fetch only the rows this instance just claimed
         var messages = await db.OutboxMessages
@@ -86,7 +86,7 @@ public class OutboxProcessor : BackgroundService
                     UPDATE OutboxMessages
                     SET ProcessedAt = {0}, LockedBy = NULL, LockedUntil = NULL
                     WHERE Id = {1} AND ProcessedAt IS NULL AND LockedBy = {2}",
-                    DateTime.UtcNow, msg.Id, InstanceId, ct);
+                    new object[] { DateTime.UtcNow, msg.Id, InstanceId }, ct);
 
                 if (updated == 0)
                 {
@@ -100,7 +100,7 @@ public class OutboxProcessor : BackgroundService
                         UPDATE DeadLetterMessages
                         SET Status = 'Succeeded'
                         WHERE ReplayedOutboxMessageId = {0} AND Status = 'Replaying'",
-                        msg.Id, ct);
+                        new object[] { msg.Id }, ct);
                 }
             }
             catch (Exception ex)
@@ -112,8 +112,8 @@ public class OutboxProcessor : BackgroundService
                     UPDATE OutboxMessages
                     SET RetryCount = {0}, Error = {1}, LockedBy = NULL, LockedUntil = NULL
                     WHERE Id = {2} AND LockedBy = {3}",
-                    newRetryCount, ex.Message[..Math.Min(ex.Message.Length, 500)],
-                    msg.Id, InstanceId, ct);
+                    new object[] { newRetryCount, ex.Message[..Math.Min(ex.Message.Length, 500)],
+                        msg.Id, InstanceId }, ct);
 
                 if (newRetryCount >= 5)
                     await DeadLetterAsync(db, msg, ex.Message, ct);
@@ -129,9 +129,9 @@ public class OutboxProcessor : BackgroundService
               (Id, OriginalOutboxMessageId, Type, Payload, LastError, RetryCount,
                OriginalCreatedAt, DeadLetteredAt, Status)
             VALUES ({0},{1},{2},{3},{4},{5},{6},{7},'Pending')",
-            Guid.NewGuid(), msg.Id, msg.Type, msg.Payload,
-            error[..Math.Min(error.Length, 2000)],
-            msg.RetryCount, msg.CreatedAt, DateTime.UtcNow, ct);
+            new object[] { Guid.NewGuid(), msg.Id, msg.Type, msg.Payload,
+                error[..Math.Min(error.Length, 2000)],
+                msg.RetryCount, msg.CreatedAt, DateTime.UtcNow }, ct);
     }
 
     private static object? DeserializeMessage(OutboxMessage msg)

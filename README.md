@@ -42,6 +42,7 @@ This system handles monthly automated billing, real-time external bank callbacks
 | Multiple pods run monthly dispatch simultaneously | Redis `SET NX` distributed lock keyed by month; Lua renewal heartbeat; per-license guards as second layer |
 | LicenseCore consumers embedded in host project | `LicenseCore.Application` project: consumers + interfaces extracted; `ILicenseRepository` abstracts all DB writes |
 | Frontend retries regenerate idempotency key | `useIdempotentMutation` hook: key in `useRef`, generated once per user intent, cleared only on success |
+| Insufficient-balance request creates an orphaned Pending payment | `POST /api/payments/quick-pay`: balance checked server-side before creation; insufficient balance creates a `Failed` audit record and returns 422 — no Pending payment is left hanging |
 
 ---
 
@@ -182,9 +183,11 @@ dotnet test src/Payment.Tests
 
 | Method | Endpoint | Auth | Notes |
 |---|---|---|---|
+| `POST` | `/api/auth/login` | — | Issue 8 h JWT from `licenseId`; returns `token`, `accountId`, `licenseId` |
 | `GET` | `/api/balance/{accountId}` | JWT | Get current balance |
 | `POST` | `/api/balance/topup` | JWT | Add funds (UPDATE-then-INSERT, retry-safe) |
-| `GET` | `/api/payments/{licenseId}?page&pageSize` | JWT | Paginated history |
+| `GET` | `/api/payments/{licenseId}?page&pageSize` | JWT | Paginated history (includes `Failed` records) |
+| `POST` | `/api/payments/quick-pay` | JWT | **Preferred**: balance check → create Pending → pay atomically; `Idempotency-Key` required |
 | `POST` | `/api/payments/create` | JWT | `Idempotency-Key` header required |
 | `POST` | `/api/payments/pay-via-balance` | JWT | `Idempotency-Key` header required |
 | `GET` | `/api/payments/overdue?page&pageSize` | JWT | Payments with `Status=Overdue` |

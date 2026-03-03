@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json.Serialization;
 using System.Threading.RateLimiting;
 using Company.Observability;
 using HealthChecks.UI.Client;
@@ -29,12 +30,18 @@ if (weakKeys.Any(w => jwtKey.Contains(w, StringComparison.OrdinalIgnoreCase)))
 if (builder.Environment.IsProduction() && jwtKey.Contains("dev", StringComparison.OrdinalIgnoreCase))
     throw new InvalidOperationException("Development key detected in production environment.");
 
-// ── Infrastructure must be registered before --migrate so PaymentDbContext ─
-// is available in the DI container when the migration branch calls Build(). ─
-builder.Services.AddMediatR(cfg =>
-    cfg.RegisterServicesFromAssembly(typeof(Payment.Application.Commands.TopUpBalanceCommand).Assembly));
-
-builder.Services.AddInfrastructure(builder.Configuration);
+// ── DbContext must be registered before --migrate (MassTransit must NOT be) ─
+builder.Services.AddDbContext<PaymentDbContext>(options =>
+    options.UseSqlServer(
+        builder.Configuration.GetConnectionString("DefaultConnection"),
+        sqlOptions =>
+        {
+            sqlOptions.EnableRetryOnFailure(
+                maxRetryCount: 5,
+                maxRetryDelay: TimeSpan.FromSeconds(30),
+                errorNumbersToAdd: null);
+            sqlOptions.CommandTimeout(30);
+        }));
 
 // ── CLI --migrate mode: run migrations and exit ───────────────────────────
 if (args.Contains("--migrate"))
@@ -46,8 +53,17 @@ if (args.Contains("--migrate"))
     return;
 }
 
+// ── Full infrastructure (MassTransit, Redis, outbox, repos) ──────────────
+builder.Services.AddMediatR(cfg =>
+    cfg.RegisterServicesFromAssembly(typeof(Payment.Application.Commands.TopUpBalanceCommand).Assembly));
+
+builder.Services.AddInfrastructure(builder.Configuration);
+
 // ── Observability ─────────────────────────────────────────────────────────
 builder.AddCompanyObservability();
+
+builder.Services.ConfigureHttpJsonOptions(o =>
+    o.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
@@ -103,17 +119,11 @@ builder.Services.AddRateLimiter(opt =>
     }));
 
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection")!;
-var rabbitHost = builder.Configuration["RabbitMQ:Host"] ?? "rabbitmq://localhost";
-var rabbitUri = new Uri(rabbitHost.Replace("rabbitmq://", "amqp://"));
-
-builder.Services.AddSingleton<RabbitMQ.Client.IConnectionFactory>(
-    _ => new RabbitMQ.Client.ConnectionFactory { Uri = rabbitUri, AutomaticRecoveryEnabled = true });
 
 builder.Services.AddSingleton<MassTransitBusHealthCheck>();
 
 builder.Services.AddHealthChecks()
     .AddSqlServer(connectionString, name: "sqlserver", tags: ["db", "ready"])
-    .AddRabbitMQ(name: "rabbitmq", tags: ["messaging", "ready"])
     .AddCheck<MassTransitBusHealthCheck>("masstransit", tags: ["messaging", "ready"])
     .AddCheck<OutboxLagHealthCheck>("outbox-lag", tags: ["ready"]);
 
@@ -152,6 +162,7 @@ app.UseRateLimiter();
 app.UseAuthentication();
 app.UseAuthorization();
 
+app.MapAuthEndpoints();
 app.MapBalanceEndpoints();
 app.MapPaymentEndpoints();
 app.MapExternalCallbackEndpoints();

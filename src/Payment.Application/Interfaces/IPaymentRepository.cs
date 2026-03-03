@@ -34,6 +34,11 @@ public interface IPaymentRepository
     /// Marks a payment as Overdue if it is currently Pending. Idempotent — safe on re-delivery.
     /// </summary>
     Task<bool> MarkOverdueAsync(Guid paymentId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Marks a payment as Failed (e.g. balance race lost after optimistic check).
+    /// </summary>
+    Task MarkFailedAsync(Guid paymentId, CancellationToken ct = default);
 }
 
 public enum ProcessBalancePaymentResult

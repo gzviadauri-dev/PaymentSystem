@@ -1,10 +1,11 @@
 import type { PaymentDto } from '../api/paymentsApi'
 
 const statusColors: Record<PaymentDto['status'], string> = {
-  Pending: 'bg-yellow-100 text-yellow-800',
-  Paid: 'bg-green-100 text-green-800',
-  Overdue: 'bg-red-100 text-red-800',
-  Cancelled: 'bg-gray-100 text-gray-500',
+  Pending:   'bg-yellow-100 text-yellow-800',
+  Paid:      'bg-green-100  text-green-800',
+  Overdue:   'bg-red-100    text-red-800',
+  Cancelled: 'bg-gray-100   text-gray-500',
+  Failed:    'bg-red-100    text-red-700',
 }
 
 interface Props {

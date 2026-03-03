@@ -224,7 +224,7 @@ erDiagram
         guid Id PK
         guid LicenseId
         decimal Amount
-        string Status "Pending|Paid|Overdue|Cancelled"
+        string Status "Pending|Paid|Overdue|Cancelled|Failed"
         string Type "Monthly|AddVehicle|AddDriver|LicenseSell|LicenceCancel"
         string ExternalPaymentId "nullable, UK with ProviderId"
         string ProviderId "nullable"
@@ -361,18 +361,18 @@ sequenceDiagram
 
 ### Command Inventory
 
-| Command | Handler | Key mechanism |
-|---|---|---|
-| `TopUpBalanceCommand` | `TopUpBalanceCommandHandler` | UPDATE-then-INSERT loop; SQL 2627/2601 retry |
-| `PayViaBalanceCommand` | `PayViaBalanceCommandHandler` | `ProcessBalancePaymentAsync` — single atomic transaction |
-| `ConfirmExternalPaymentCommand` | `ConfirmExternalPaymentCommandHandler` | `TryConfirmExternalAtomicallyAsync` — CAS + outbox |
-| `CreatePaymentCommand` | `CreatePaymentCommandHandler` | Raw SQL INSERT + idempotency key |
+| Command                         | Handler                                | Key mechanism                                            |
+| ------------------------------- | -------------------------------------- | -------------------------------------------------------- |
+| `TopUpBalanceCommand`           | `TopUpBalanceCommandHandler`           | UPDATE-then-INSERT loop; SQL 2627/2601 retry             |
+| `PayViaBalanceCommand`          | `PayViaBalanceCommandHandler`          | `ProcessBalancePaymentAsync` — single atomic transaction |
+| `ConfirmExternalPaymentCommand` | `ConfirmExternalPaymentCommandHandler` | `TryConfirmExternalAtomicallyAsync` — CAS + outbox       |
+| `CreatePaymentCommand`          | `CreatePaymentCommandHandler`          | Raw SQL INSERT + idempotency key                         |
 
 ### Query Inventory
 
-| Query | Result |
-|---|---|
-| `GetBalanceQuery` | `{ accountId, amount }` |
+| Query                              | Result                                              |
+| ---------------------------------- | --------------------------------------------------- |
+| `GetBalanceQuery`                  | `{ accountId, amount }`                             |
 | `GetPaymentsQuery(page, pageSize)` | `{ payments[], page, pageSize, total, totalPages }` |
 
 ---
@@ -685,13 +685,13 @@ If pod-A crashes after Publish but before ProcessedAt update:
   → Consumer receives duplicate → idempotency guard absorbs it
 ```
 
-### IdempotencyKey Cleanup
+### IdempotencyKey TTL
 
 ```
-IdempotencyKeyCleanupService (BackgroundService)
-→ Runs every 1 hour
-→ DELETE FROM IdempotencyKeys WHERE CreatedAt < DATEADD(hour, -24, GETUTCDATE())
-→ Prevents unbounded table growth; 24-hour TTL still covers all realistic client retries
+Keys are stored in Redis (not SQL Server) with a 24-hour TTL set atomically at creation.
+→ Redis expires keys automatically at the storage layer — no cleanup service needed.
+→ No background service, no scheduled DELETE, no index for range scans.
+→ See Section 11 (IdempotencyKey Storage) for key format and sentinel semantics.
 ```
 
 ---
@@ -728,11 +728,11 @@ graph LR
 
 ### What Is Instrumented
 
-| Signal | What is captured |
-|---|---|
-| **Logs** | Correlation ID on every entry · PII fields redacted · request/response at `Information` · errors at `Error` · per-license monthly dispatch failures at `Critical` with `LicenseId` + `Month` |
-| **Traces** | Every HTTP request span · outbound `HttpClient` spans · correlation ID propagated as baggage |
-| **Metrics** | Request duration · request count · error rate · `monthly_debt_dispatch_failures` counter (tags: `licenseId`, `month`) exported via `Meter("LicenseCore.API")` registered with OTEL |
+| Signal      | What is captured                                                                                                                                                                             |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Logs**    | Correlation ID on every entry · PII fields redacted · request/response at `Information` · errors at `Error` · per-license monthly dispatch failures at `Critical` with `LicenseId` + `Month` |
+| **Traces**  | Every HTTP request span · outbound `HttpClient` spans · correlation ID propagated as baggage                                                                                                 |
+| **Metrics** | Request duration · request count · error rate · `monthly_debt_dispatch_failures` counter (tags: `licenseId`, `month`) exported via `Meter("LicenseCore.API")` registered with OTEL           |
 
 ### Environment Configuration
 
@@ -813,45 +813,45 @@ sequenceDiagram
     participant C as Mobile Client
     participant C2 as Mobile Client (concurrent)
     participant A as API
-    participant DB as IdempotencyKeys table
+    participant RD as Redis
 
     Note over C,C2: Case 1 — happy path
     C->>A: POST /pay-via-balance\nIdempotency-Key: client-uuid-1
-    A->>DB: INSERT Key, StatusCode=0 WHERE NOT EXISTS → rows=1
+    A->>RD: SET key {StatusCode=0} NX PX 86400000 → OK (claimed)
     Note over A: Slot claimed — this request owns the key
     A->>A: Execute command (balance debit)
-    A->>DB: UPDATE Key SET ResponsePayload=..., StatusCode=200
+    A->>RD: SET key {StatusCode=200, Payload=...} XX PX 86400000
     A-->>C: 200 { success: true }
 
     Note over C: Network timeout — client retries
 
     C->>A: POST /pay-via-balance\nIdempotency-Key: client-uuid-1
-    A->>DB: INSERT StatusCode=0 WHERE NOT EXISTS → rows=0 (key exists)
-    A->>DB: SELECT → StatusCode=200 (completed)
+    A->>RD: SET key {StatusCode=0} NX → nil (key exists)
+    A->>RD: GET key → {StatusCode=200} (completed)
     A-->>C: 200 { success: true }  ← cached, no second debit
 
     Note over C,C2: Case 2 — two simultaneous first-time requests
     C->>A: POST (key: uuid-1)
     C2->>A: POST (key: uuid-1) simultaneously
-    A->>DB: INSERT StatusCode=0 WHERE NOT EXISTS → rows=1 (C wins the slot)
-    A->>DB: INSERT StatusCode=0 WHERE NOT EXISTS → rows=0 (C2 loses)
-    A->>DB: SELECT → StatusCode=0 (still Processing)
+    A->>RD: SET key NX → OK  (C wins)
+    A->>RD: SET key NX → nil (C2 loses)
+    A->>RD: GET key → {StatusCode=0} (still Processing)
     A-->>C2: 409 Conflict + Retry-After: 2  ← only C2 is rejected
-    Note over C: Executes command normally, updates StatusCode
-    C2->>A: retry after 2 seconds → StatusCode=200 → cached response
+    Note over C: Executes command, writes StatusCode=200
+    C2->>A: retry after 2 seconds → GET → StatusCode=200 → cached response
 
-    Note over C,C2: Case 3 — abandoned slot (crash after INSERT, before UPDATE)
+    Note over C,C2: Case 3 — abandoned slot (crash after SET NX, before SET XX)
     C->>A: POST /pay-via-balance\nIdempotency-Key: client-uuid-2
-    A->>DB: INSERT StatusCode=0 → rows=1
-    Note over A: API pod crashes before UPDATE
+    A->>RD: SET key {StatusCode=0} NX → OK
+    Note over A: API pod crashes before SET XX
     Note over C: Client retries after 30+ seconds
     C->>A: POST /pay-via-balance\nIdempotency-Key: client-uuid-2
-    A->>DB: INSERT → rows=0 (slot exists)
-    A->>DB: SELECT → StatusCode=0, CreatedAt > 30s ago
-    A->>DB: DELETE WHERE Key=uuid-2 AND StatusCode=0 AND CreatedAt < now-30s
-    A->>DB: INSERT StatusCode=0 WHERE NOT EXISTS → rows=1 (reclaimed)
+    A->>RD: SET key NX → nil (slot exists)
+    A->>RD: GET key → {StatusCode=0, CreatedAt > 30s ago}
+    A->>RD: DEL key  (abandoned — reclaim)
+    A->>RD: SET key {StatusCode=0} NX → OK (reclaimed)
     A->>A: Execute command (fresh attempt)
-    A->>DB: UPDATE StatusCode=200
+    A->>RD: SET key {StatusCode=200} XX PX 86400000
     A-->>C: 200 { success: true }
 ```
 
@@ -1054,18 +1054,19 @@ graph TB
 
 All services have Docker healthchecks. APIs wait for `service_healthy` on SQL Server, RabbitMQ, and Redis, and `service_completed_successfully` on the migration init containers.
 
-| Service | Port | Image | Role |
-|---|---|---|---|
-| SQL Server 2022 | 1433 | mcr.microsoft.com/mssql/server:2022-latest | Primary data store |
-| RabbitMQ 3 | 5672 / 15672 | rabbitmq:3-management | Message broker |
-| Redis 7 | 6379 | redis:7-alpine | Idempotency keys (24 h TTL), dispatch lock, health cache |
-| OTEL Collector | 4317 gRPC | otel/opentelemetry-collector-contrib | Telemetry pipeline |
-| Jaeger | 16686 | jaegertracing/all-in-one:1.58 | Distributed tracing UI |
-| Prometheus | 9090 | prom/prometheus:v2.53.0 | Metrics scrape + storage |
-| Grafana | 3001 | grafana/grafana:11.1.0 | Dashboards |
-| Graylog 6.1 | 9000 | graylog/graylog:6.1 | Structured log aggregation |
+| Service         | Port         | Image                                      | Role                                                     |
+| --------------- | ------------ | ------------------------------------------ | -------------------------------------------------------- |
+| SQL Server 2022 | 1433         | mcr.microsoft.com/mssql/server:2022-latest | Primary data store                                       |
+| RabbitMQ 3      | 5672 / 15672 | rabbitmq:3-management                      | Message broker                                           |
+| Redis 7         | 6379         | redis:7-alpine                             | Idempotency keys (24 h TTL), dispatch lock, health cache |
+| OTEL Collector  | 4317 gRPC    | otel/opentelemetry-collector-contrib       | Telemetry pipeline                                       |
+| Jaeger          | 16686        | jaegertracing/all-in-one:1.58              | Distributed tracing UI                                   |
+| Prometheus      | 9090         | prom/prometheus:v2.53.0                    | Metrics scrape + storage                                 |
+| Grafana         | 3001         | grafana/grafana:11.1.0                     | Dashboards                                               |
+| Graylog 6.1     | 9000         | graylog/graylog:6.1                        | Structured log aggregation                               |
 
 SQL Server connections in both services are configured with:
+
 - `EnableRetryOnFailure(maxRetryCount: 5, maxRetryDelay: 30s)` — automatic transient fault retry
 - `CommandTimeout(30)` — prevents connection pool starvation on slow queries
 - All `BeginTransactionAsync` calls wrapped in `CreateExecutionStrategy().ExecuteAsync(...)` — retry-safe manual transactions
@@ -1151,11 +1152,13 @@ SQL Server connections in both services are configured with:
 **Problem**: The original SQL `IdempotencyKeys` table required a background cleanup service (`IdempotencyKeyCleanupService`, hourly), a dedicated index (`IX_IdempotencyKeys_CreatedAt`), and a write transaction per endpoint call. A secondary problem: if the API pod crashes after the `INSERT` but before the `UPDATE`, the slot stays at `StatusCode = 0` permanently, locking the client out with repeated 409s for 24 hours.
 
 **Decision**: Moved to Redis. Three-state sentinel model:
+
 - `StatusCode = 0` — Processing: INSERT was issued, command is in-flight (or slot was abandoned by a crash).
 - `StatusCode = -1` — Failed: command threw an unhandled exception; error payload stored for the client.
 - `StatusCode ≥ 100` — Completed: real HTTP result cached, return immediately.
 
 Redis `SET NX PX` (set-if-not-exists with millisecond expiry) atomically claims the slot — returns `true` only if the key did not exist. On claim failure, `GET` the existing value:
+
 - `StatusCode = -1` → return `500` with the stored error payload; client must use a new key.
 - `StatusCode ≥ 100` (and within 24 h TTL) → return cached response.
 - `StatusCode = 0` and `CreatedAt > now − 30 s` → slot is actively in-flight, return `409 Conflict`.
@@ -1171,15 +1174,16 @@ Command execution is wrapped in try/catch: on any unhandled exception the slot i
 
 **Decision**: Add Redis 7 (single node, append-only persistence) for exactly these three concerns. Scope is strictly bounded:
 
-| Concern | Redis usage | What was replaced |
-|---|---|---|
-| Idempotency keys | `SET NX PX` + `SET XX PX` — 24 h TTL per key | SQL `IdempotencyKeys` table + cleanup service |
-| Monthly dispatch lock | `SET NX PX` + Lua renewal heartbeat | `sp_getapplock` SQL transaction |
-| Health check cache | `IDistributedCache` `GetStringAsync`/`SetStringAsync` | Per-pod `SemaphoreSlim` double-checked lock |
+| Concern               | Redis usage                                           | What was replaced                             |
+| --------------------- | ----------------------------------------------------- | --------------------------------------------- |
+| Idempotency keys      | `SET NX PX` + `SET XX PX` — 24 h TTL per key          | SQL `IdempotencyKeys` table + cleanup service |
+| Monthly dispatch lock | `SET NX PX` + Lua renewal heartbeat                   | `sp_getapplock` SQL transaction               |
+| Health check cache    | `IDistributedCache` `GetStringAsync`/`SetStringAsync` | Per-pod `SemaphoreSlim` double-checked lock   |
 
 Redis is **not** used for: outbox messages (must be in the same SQL transaction as the payment update), balance/payment row locking (`UPDLOCK` is superior when data lives in SQL), saga state (MassTransit manages this in SQL Server with pessimistic locking), or session state (JWT is stateless).
 
 **Failure modes**:
+
 - **Idempotency path**: `RedisException` during `TryClaimAsync` → `503 Service Unavailable`. The request is rejected rather than forwarding to the command handler — a silent Redis failure must not bypass the guard and allow double-spend.
 - **Dispatch lock path**: Redis unavailable → lock acquisition fails gracefully; dispatch proceeds without the lock (log `Warning`). The per-license `INSERT WHERE NOT EXISTS` guards still prevent double-billing.
 - **Health cache path**: Redis unavailable → fall through to live SQL `COUNT(*)` query; no error surfaced to the caller.
@@ -1222,6 +1226,22 @@ Redis is preferred over `sp_getapplock` because it does not hold an open SQL Ser
 
 ---
 
+### `POST /api/payments/quick-pay` — balance check before payment creation
+
+**Problem**: The original two-step flow (`POST /api/payments/create` then `POST /api/payments/pay-via-balance`) created a `Pending` payment first and attempted to debit the balance second. If the balance was insufficient at the time of the debit, the payment remained in `Pending` state permanently. After the user topped up their balance, those orphaned `Pending` payments were never automatically retried — they accumulated in the history with no path to resolution other than manual intervention.
+
+**Decision**: Introduce `POST /api/payments/quick-pay` as a single combined endpoint that:
+
+1. **Reads balance first** (optimistic, non-locked). If `available < requested`, inserts a `Failed` payment as an audit record and returns `422 Unprocessable Entity` with a human-readable `reason` field (`"Insufficient balance. Required: X GEL, available: Y GEL."`). No `Pending` row is created.
+2. **If balance is sufficient**, creates a `Pending` payment via `CreatePaymentCommand`, then immediately calls `ProcessBalancePaymentAsync` — which holds `UPDLOCK` on both the Balance and Payment rows in a single SQL Server transaction. This is the same atomic lock used by `pay-via-balance`, so the `CHECK (Amount >= 0)` constraint and the `UPDATE WHERE Status='Pending'` CAS guard both apply.
+3. **Race condition handling**: if another concurrent request drains the balance between the optimistic check (step 1) and the locked debit (step 2), `ProcessBalancePaymentAsync` returns `InsufficientBalance`. The endpoint calls `MarkFailedAsync` on the just-created payment (preventing a `Pending` orphan) and returns `422`.
+
+The `Failed` status was added to the `PaymentStatus` enum (stored as the string `"Failed"` via `HasConversion<string>()`). No schema migration is required — the column is `nvarchar(450)` and EF stores enum names as strings.
+
+The endpoint uses the same `Idempotency-Key` / Redis `SET NX` guard as all other mutating endpoints. The frontend `generateAndPay()` function treats `422` responses as a resolved result (not a thrown exception) so the calling component always has a `{ success, reason }` value to display in the toast system.
+
+---
+
 ### SQL Server connection resiliency + ExecutionStrategy
 
 **Problem**: Transient SQL Server failures (TCP resets, connection pool exhaustion, brief failovers) cause immediate exceptions that propagate to the user as 500 errors. Manual `BeginTransactionAsync` outside an execution strategy cannot be retried because the transaction state is undefined after a failure.
@@ -1248,18 +1268,20 @@ Every mutating payment operation uses the `useIdempotentMutation` hook. Key beha
 After a successful payment submission (`200`/`201`), the business-side action (vehicle activation, driver activation, license activation) is processed asynchronously via the saga + `PaymentCompletedConsumer`. The frontend must not assume immediate activation.
 
 **Hook contract** (`useActivationPolling`):
+
 - Accepts a `fetchFn` (calls `GET /api/licenses/{id}` or similar) and an `enabled` flag.
 - When `enabled` becomes `true`, polls `fetchFn` every 5 s for up to 60 s.
 - Resolves to one of four `ActivationStatus` values:
 
-| Status | UI treatment |
-|---|---|
-| `idle` | Nothing shown (pre-payment state) |
-| `polling` | "Payment received — activation pending" + spinner |
-| `activated` | "Activated" badge; stop polling |
-| `timeout` | "Activation is taking longer than expected — please refresh or contact support." |
+| Status      | UI treatment                                                                     |
+| ----------- | -------------------------------------------------------------------------------- |
+| `idle`      | Nothing shown (pre-payment state)                                                |
+| `polling`   | "Payment received — activation pending" + spinner                                |
+| `activated` | "Activated" badge; stop polling                                                  |
+| `timeout`   | "Activation is taking longer than expected — please refresh or contact support." |
 
 **Required post-payment steps in the component**:
+
 1. On `200` response: invalidate `['payments', licenseId]` and `['balance', accountId]` immediately (handled by `useIdempotentMutation`'s `invalidateKeys`).
 2. Set `enabled = true` on `useActivationPolling` to begin the 60-second watch.
 3. Display the correct status label from `useActivationPolling.status`.
@@ -1268,11 +1290,58 @@ After a successful payment submission (`200`/`201`), the business-side action (v
 
 Payment flow pages (`Payments.tsx`, `Dashboard.tsx`) must be wrapped in a React Error Boundary. On an unhandled render-phase error, the boundary renders a generic error card with a "Return to dashboard" link. Raw error messages and stack traces must never be shown to the user.
 
+### Quick-Pay UI (`Web/src/components/QuickPay.tsx`)
+
+The `QuickPay` component on the Dashboard renders one button per `PaymentType` (Monthly, AddVehicle, AddDriver, LicenseSell, LicenceCancel) plus a "Stress Test 3×" button that fires three concurrent quick-pay requests simultaneously. Each button:
+
+1. Calls `generateAndPay(licenseId, accountId, type, amount)` — a single `POST /api/payments/quick-pay` with a fresh `crypto.randomUUID()` idempotency key.
+2. Shows a per-button state: `idle → pending (spinner) → success (green) → idle after 2.5 s`.
+3. On success: fires a green toast and invalidates the payments + balance queries.
+4. On `422` (insufficient balance): the API response already contains `{ success: false, reason: "Insufficient balance. Required: X GEL, available: Y GEL." }`. The function surfaces it as a resolved result (not a thrown error), so the component shows a red toast with the exact server message.
+5. On any other error: shows a red toast with the `error` field from the response body if present, otherwise a generic fallback.
+
+The server always records the attempt — a `Failed` payment row is written to the database when balance is insufficient, giving a complete audit trail in the payment history.
+
+### Toast Notification System
+
+`Web/src/store/toastStore.ts` (Zustand) + `Web/src/components/ToastContainer.tsx` implement a lightweight in-app toast stack:
+
+- `toast('success' | 'error' | 'info', title, message)` — adds a toast to the global store.
+- Each toast auto-dismisses after 4 s; can also be manually closed.
+- `<ToastContainer />` is mounted at the root of the app (`App.tsx`) so it renders above all routes.
+- Toast entrance uses a `@keyframes fade-in` CSS animation defined in `index.css`.
+
+### Authentication Flow (`Web/src/pages/Login.tsx`)
+
+The frontend uses a simple license-ID–based login:
+
+1. User enters a License ID (GUID) on `/login`.
+2. `POST /api/auth/login` returns a signed 8-hour JWT containing `sub`, `licenseId`, and `accountId` claims (all set to the provided GUID).
+3. The token, `accountId`, and `licenseId` are stored in `useAuthStore` (Zustand, persisted to `localStorage`).
+4. All protected routes redirect to `/login` if `accountId` is null.
+5. API calls add `Authorization: Bearer <token>` via an Axios request interceptor.
+
+### PaymentStatus Display
+
+| Status     | Badge color         | Meaning                                             |
+| ---------- | ------------------- | --------------------------------------------------- |
+| `Pending`  | Yellow              | Created; awaiting payment                           |
+| `Paid`     | Green               | Debit succeeded; outbox event published             |
+| `Overdue`  | Red                 | Grace period expired; saga timed out                |
+| `Cancelled`| Gray                | Manually cancelled                                  |
+| `Failed`   | Red (darker)        | Attempted but insufficient balance at time of request |
+
 ### Key Files
 
 ```
 Web/src/hooks/useIdempotentMutation.ts   ← idempotency key lifecycle + 409 retry loop
 Web/src/hooks/useActivationPolling.ts    ← polls until entity IsActive changes
-Web/src/pages/Payments.tsx               ← uses both hooks for payment submission flow
-Web/src/pages/Dashboard.tsx              ← balance widget + per-entity activation status
+Web/src/pages/Login.tsx                 ← license-ID login, JWT storage
+Web/src/pages/Dashboard.tsx             ← balance widget + QuickPay buttons
+Web/src/pages/Payments.tsx              ← uses both hooks for payment submission flow
+Web/src/components/QuickPay.tsx         ← per-type payment buttons + stress-test button
+Web/src/components/PaymentCard.tsx      ← status badge (includes Failed)
+Web/src/components/ToastContainer.tsx   ← global toast renderer
+Web/src/store/toastStore.ts             ← Zustand toast store + toast() helper
+Web/src/api/paymentsApi.ts              ← generateAndPay() → POST /api/payments/quick-pay
 ```

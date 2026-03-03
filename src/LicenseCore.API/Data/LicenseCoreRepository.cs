@@ -23,7 +23,7 @@ public class LicenseCoreRepository : ILicenseRepository
     {
         var rows = await _db.Database.ExecuteSqlRawAsync(
             "UPDATE Vehicles SET IsActive = 1 WHERE LicenseId = {0} AND IsActive = 0",
-            licenseId, ct);
+            new object[] { licenseId }, ct);
 
         if (rows > 0)
             _logger.LogInformation("Vehicle activated for license {LicenseId}", licenseId);
@@ -35,7 +35,7 @@ public class LicenseCoreRepository : ILicenseRepository
     {
         var rows = await _db.Database.ExecuteSqlRawAsync(
             "UPDATE Drivers SET IsActive = 1 WHERE Id = {0} AND LicenseId = {1} AND IsActive = 0",
-            driverId, licenseId, ct);
+            new object[] { driverId, licenseId }, ct);
 
         if (rows > 0)
             _logger.LogInformation("Driver {DriverId} activated for license {LicenseId}", driverId, licenseId);
@@ -47,7 +47,7 @@ public class LicenseCoreRepository : ILicenseRepository
     {
         var rows = await _db.Database.ExecuteSqlRawAsync(
             "UPDATE Licenses SET IsActive = 1 WHERE Id = {0} AND IsActive = 0",
-            licenseId, ct);
+            new object[] { licenseId }, ct);
 
         if (rows > 0)
             _logger.LogInformation("License {LicenseId} activated", licenseId);
@@ -59,7 +59,7 @@ public class LicenseCoreRepository : ILicenseRepository
     {
         var rows = await _db.Database.ExecuteSqlRawAsync(
             "UPDATE Licenses SET IsActive = 0 WHERE Id = {0} AND IsActive = 1",
-            licenseId, ct);
+            new object[] { licenseId }, ct);
 
         if (rows > 0)
             _logger.LogInformation("License {LicenseId} deactivated", licenseId);
@@ -85,7 +85,7 @@ public class LicenseCoreRepository : ILicenseRepository
             WHERE NOT EXISTS (
                 SELECT 1 FROM MonthlyPayments
                 WHERE LicenseId = {1} AND Month = {2})",
-            Guid.NewGuid(), licenseId, normalised, DateTime.UtcNow, ct);
+            new object[] { Guid.NewGuid(), licenseId, normalised, DateTime.UtcNow }, ct);
 
         if (inserted > 0)
             _logger.LogInformation(
