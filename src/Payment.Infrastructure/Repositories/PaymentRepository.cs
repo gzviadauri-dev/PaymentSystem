@@ -128,47 +128,108 @@ public class PaymentRepository : IPaymentRepository
     }
 
     /// <inheritdoc/>
-    public async Task<(bool Confirmed, Guid? PaymentId)> TryConfirmExternalAtomicallyAsync(
-        string externalPaymentId, string providerId, DateTime paidAt, CancellationToken ct = default)
+    public async Task<ConfirmResult> TryConfirmExternalAtomicallyAsync(
+        Guid paymentId, string externalPaymentId, string providerId, CancellationToken ct = default)
     {
         var strategy = _db.Database.CreateExecutionStrategy();
         return await strategy.ExecuteAsync(async () =>
         {
             await using var tx = await _db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+            try
+            {
+                // Filter by Id + LockedProviderId — not ExternalPaymentId (which starts NULL).
+                // Write ExternalPaymentId and ProviderId atomically in the same UPDATE
+                // that marks the payment Paid.
+                var rows = await _db.Database.ExecuteSqlRawAsync(@"
+                    UPDATE Payments
+                    SET    Status            = 'Paid',
+                           PaidAt            = GETUTCDATE(),
+                           ExternalPaymentId = {0},
+                           ProviderId        = {1}
+                    WHERE  Id               = {2}
+                      AND  Status           = 'Pending'
+                      AND  LockedProviderId = {1}",
+                    externalPaymentId, providerId, paymentId,
+                    cancellationToken: ct);
 
-            var affected = await _db.Database.ExecuteSqlRawAsync(@"
+                if (rows == 0)
+                {
+                    await tx.RollbackAsync(ct);
+
+                    // Diagnose why rows = 0 to return the correct result
+                    var existing = await _db.Payments
+                        .AsNoTracking()
+                        .Where(p => p.Id == paymentId)
+                        .Select(p => new { p.Status, p.LockedProviderId, p.ExternalPaymentId })
+                        .FirstOrDefaultAsync(ct);
+
+                    if (existing == null)
+                        throw new InvalidOperationException($"Payment {paymentId} not found.");
+
+                    if (existing.Status == PaymentStatus.Paid)
+                        return new ConfirmResult(IsAlreadyProcessed: true, WrongProvider: false);
+
+                    if (existing.LockedProviderId != providerId)
+                        return new ConfirmResult(IsAlreadyProcessed: false, WrongProvider: true);
+
+                    return new ConfirmResult(IsAlreadyProcessed: true, WrongProvider: false);
+                }
+
+                // rows = 1 — winner. Write outbox entry in the same transaction.
+                await WriteOutboxRawAsync(
+                    nameof(PaymentConfirmedEvent),
+                    new PaymentConfirmedEvent(paymentId, providerId, DateTime.UtcNow),
+                    ct);
+
+                await tx.CommitAsync(ct);
+                return new ConfirmResult(IsAlreadyProcessed: false, WrongProvider: false);
+            }
+            catch
+            {
+                await tx.RollbackAsync(ct);
+                throw;
+            }
+        });
+    }
+
+    /// <inheritdoc/>
+    public async Task<LockProviderResult> LockProviderAsync(
+        Guid paymentId, string providerId, CancellationToken ct = default)
+    {
+        var strategy = _db.Database.CreateExecutionStrategy();
+        return await strategy.ExecuteAsync(async () =>
+        {
+            // Atomic: set LockedProviderId only if currently NULL
+            var rows = await _db.Database.ExecuteSqlRawAsync(@"
                 UPDATE Payments
-                SET Status = 'Paid', PaidAt = {0}
-                WHERE ExternalPaymentId = {1}
-                  AND ProviderId = {2}
-                  AND Status = 'Pending'",
-                new object[] { paidAt, externalPaymentId, providerId }, ct);
+                SET    LockedProviderId = {0}
+                WHERE  Id     = {1}
+                  AND  Status = 'Pending'
+                  AND  LockedProviderId IS NULL",
+                providerId, paymentId,
+                cancellationToken: ct);
 
-            if (affected == 0)
-            {
-                await tx.RollbackAsync(ct);
-                return (false, (Guid?)null);
-            }
+            if (rows == 1)
+                return LockProviderResult.Locked;
 
-            var payment = await _db.Payments
+            // Row exists but lock was not set — check why
+            var existing = await _db.Payments
                 .AsNoTracking()
-                .FirstOrDefaultAsync(p =>
-                    p.ExternalPaymentId == externalPaymentId &&
-                    p.ProviderId == providerId, ct);
+                .Where(p => p.Id == paymentId)
+                .Select(p => new { p.LockedProviderId, p.Status })
+                .FirstOrDefaultAsync(ct);
 
-            if (payment is null)
-            {
-                await tx.RollbackAsync(ct);
-                return (false, (Guid?)null);
-            }
+            if (existing == null)
+                throw new InvalidOperationException($"Payment {paymentId} not found.");
 
-            await WriteOutboxRawAsync(
-                nameof(PaymentConfirmedEvent),
-                new PaymentConfirmedEvent(payment.Id, providerId, paidAt),
-                ct);
+            if (existing.Status != PaymentStatus.Pending)
+                throw new InvalidOperationException(
+                    $"Payment {paymentId} is not Pending — cannot lock provider.");
 
-            await tx.CommitAsync(ct);
-            return (true, (Guid?)payment.Id);
+            if (existing.LockedProviderId == providerId)
+                return LockProviderResult.AlreadyLockedSame;
+
+            return LockProviderResult.AlreadyLockedOther;
         });
     }
 

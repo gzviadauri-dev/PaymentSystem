@@ -16,7 +16,7 @@
 8. [Concurrency Model](#8-concurrency-model)
 9. [Transactional Outbox Pattern](#9-transactional-outbox-pattern)
 10. [Observability Pipeline](#10-observability-pipeline)
-11. [Security Model](#11-security-model)
+11. [Security Model](#11-security-model) — JWT · HMAC Webhook · Provider Lock · Rate Limiting · CORS · Idempotency
 12. [Database Schema](#12-database-schema)
 13. [Infrastructure Stack](#13-infrastructure-stack)
 14. [Design Decisions](#14-design-decisions)
@@ -226,8 +226,9 @@ erDiagram
         decimal Amount
         string Status "Pending|Paid|Overdue|Cancelled|Failed"
         string Type "Monthly|AddVehicle|AddDriver|LicenseSell|LicenceCancel"
-        string ExternalPaymentId "nullable, UK with ProviderId"
-        string ProviderId "nullable"
+        string ExternalPaymentId "nullable — written atomically at confirm time"
+        string ProviderId "nullable — written atomically at confirm time"
+        string LockedProviderId "nullable — set at redirect time, prevents wrong-provider confirm"
         guid TargetId "nullable — driver or vehicle"
         datetime Month "nullable — for Monthly type"
         datetime CreatedAt
@@ -365,7 +366,7 @@ sequenceDiagram
 | ------------------------------- | -------------------------------------- | -------------------------------------------------------- |
 | `TopUpBalanceCommand`           | `TopUpBalanceCommandHandler`           | UPDATE-then-INSERT loop; SQL 2627/2601 retry             |
 | `PayViaBalanceCommand`          | `PayViaBalanceCommandHandler`          | `ProcessBalancePaymentAsync` — single atomic transaction |
-| `ConfirmExternalPaymentCommand` | `ConfirmExternalPaymentCommandHandler` | `TryConfirmExternalAtomicallyAsync` — CAS + outbox       |
+| `ConfirmExternalPaymentCommand` | `ConfirmExternalPaymentCommandHandler` | `TryConfirmExternalAtomicallyAsync` — filters by `Id + LockedProviderId`; writes `ExternalPaymentId` atomically |
 | `CreatePaymentCommand`          | `CreatePaymentCommandHandler`          | Raw SQL INSERT + idempotency key                         |
 
 ### Query Inventory
@@ -508,11 +509,13 @@ flowchart TD
     B -->|Yes| D[Compute HMAC-SHA256\nof raw request body]
     D --> E{Constant-time\ncomparison passes?}
     E -->|No| F[401 Unauthorized\nlog warning]
-    E -->|Yes| G[ConfirmExternalPaymentCommand]
-    G --> H[BEGIN TRAN ReadCommitted\nwrapped in ExecutionStrategy]
-    H --> I[UPDATE Payments\nSET Status='Paid'\nWHERE ExternalId AND Status='Pending']
+    E -->|Yes| G[Extract paymentId\nfrom callback body]
+    G --> LP{LockedProviderId\nmatches providerId?}
+    LP -->|No| LPF[200 processed=false\nidempotent=true\nLogWarning wrong provider]
+    LP -->|Yes| H[BEGIN TRAN ReadCommitted\nwrapped in ExecutionStrategy]
+    H --> I[UPDATE Payments\nSET Status='Paid' ExternalPaymentId ProviderId\nWHERE Id AND LockedProviderId AND Status='Pending']
     I --> J{rows_affected?}
-    J -->|0| K[ROLLBACK\nIsAlreadyProcessed = true]
+    J -->|0| K[ROLLBACK — diagnose:\nAlready Paid → idempotent\nWrongProvider → LogWarning]
     J -->|1| L[INSERT OutboxMessages\nPaymentConfirmedEvent]
     L --> M[COMMIT]
     K --> N[200 processed=true idempotent=true]
@@ -577,19 +580,21 @@ sequenceDiagram
 
 ### Duplicate External Confirm
 
+The UPDATE now filters by `Id` and `LockedProviderId` rather than `ExternalPaymentId`. `ExternalPaymentId` starts `NULL` and is written atomically in the same UPDATE that marks the payment `Paid`. `LockedProviderId` is set at redirect time — only the provider the user was redirected to can confirm the payment. A different provider getting `rows_affected = 0` receives `200 idempotent` and a `LogWarning` is emitted.
+
 ```mermaid
 sequenceDiagram
     participant R1 as Request 1 (bank retry #1)
     participant R2 as Request 2 (bank retry #2)
     participant DB as SQL Server
 
-    R1->>DB: UPDATE Payments SET Status='Paid'\nWHERE ExternalId='TBC-99' AND Status='Pending'
-    R2->>DB: UPDATE Payments SET Status='Paid'\nWHERE ExternalId='TBC-99' AND Status='Pending'
+    R1->>DB: UPDATE Payments\n  SET Status='Paid', ExternalPaymentId, ProviderId\n  WHERE Id=X AND LockedProviderId='TBC' AND Status='Pending'
+    R2->>DB: UPDATE Payments\n  SET Status='Paid', ExternalPaymentId, ProviderId\n  WHERE Id=X AND LockedProviderId='TBC' AND Status='Pending'
     Note over DB: SQL Server row-lock serialises both UPDATEs
     DB-->>R1: rows_affected = 1  ← WINNER
-    DB-->>R2: rows_affected = 0  ← IDEMPOTENT
+    DB-->>R2: rows_affected = 0  ← IDEMPOTENT (Status now 'Paid')
     R1-->>R1: write outbox + commit
-    R2-->>R2: return IsAlreadyProcessed=true
+    R2-->>R2: diagnose: Status='Paid' → IsAlreadyProcessed=true
     Note over R1,R2: Both return HTTP 200 — bank stops retrying
 ```
 
@@ -773,6 +778,28 @@ API verifies:
      └─ Constant-time: prevents timing oracle attacks
 ```
 
+### Provider Lock — LockedProviderId
+
+```
+POST /api/payments/{paymentId}/redirect sets LockedProviderId atomically:
+  UPDATE Payments
+  SET    LockedProviderId = @providerId
+  WHERE  Id = @paymentId AND Status = 'Pending' AND LockedProviderId IS NULL
+
+Result:
+  Locked            → first redirect; proceed to generate redirect URL
+  AlreadyLockedSame → idempotent retry to same provider; proceed
+  AlreadyLockedOther → 409 Conflict { error: "payment_locked_to_other_provider" }
+
+POST /api/payments/external/confirm enforces the lock:
+  UPDATE ... WHERE Id = @paymentId AND LockedProviderId = @providerId AND Status = 'Pending'
+  rows_affected = 0 and LockedProviderId ≠ providerId
+    → 200 { processed:false, idempotent:true } + LogWarning (malicious or misconfigured)
+
+Invariant: ExternalPaymentId starts NULL and is written in the same UPDATE
+that marks the payment Paid — it is never a prerequisite for confirmation.
+```
+
 ### Rate Limiting — External Callback
 
 ```
@@ -876,21 +903,32 @@ accumulate in the error queue and mask genuine payment processing failures.
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │ Payments                                                         │
-│  Id              uniqueidentifier   PK                           │
-│  LicenseId       uniqueidentifier   NOT NULL                     │
-│  Amount          decimal(18,4)      NOT NULL                     │
-│  Status          nvarchar           'Pending'|'Paid'|'Overdue'   │
-│  Type            nvarchar           'Monthly'|'AddVehicle'|…     │
-│  ExternalPaymentId nvarchar         NULLABLE                     │
-│  ProviderId      nvarchar           NULLABLE                     │
-│  TargetId        uniqueidentifier   NULLABLE                     │
-│  Month           datetime2          NULLABLE                     │
-│  CreatedAt       datetime2          NOT NULL                     │
-│  PaidAt          datetime2          NULLABLE                     │
+│  Id               uniqueidentifier   PK                          │
+│  LicenseId        uniqueidentifier   NOT NULL                    │
+│  Amount           decimal(18,4)      NOT NULL                    │
+│  Status           nvarchar           'Pending'|'Paid'|'Overdue'  │
+│                                      'Cancelled'|'Failed'        │
+│  Type             nvarchar           'Monthly'|'AddVehicle'|…    │
+│  ExternalPaymentId nvarchar(450)     NULLABLE — written at       │
+│                                      confirm time, not before    │
+│  ProviderId       nvarchar(450)      NULLABLE — written at       │
+│                                      confirm time, not before    │
+│  LockedProviderId nvarchar(50)       NULLABLE — set at redirect  │
+│                                      time, guards confirm        │
+│  TargetId         uniqueidentifier   NULLABLE                    │
+│  Month            datetime2          NULLABLE                    │
+│  CreatedAt        datetime2          NOT NULL                    │
+│  PaidAt           datetime2          NULLABLE                    │
 │                                                                  │
 │  IX_Payments_ExternalPaymentId_ProviderId  UNIQUE                │
 │    WHERE ExternalPaymentId IS NOT NULL                           │
 └─────────────────────────────────────────────────────────────────┘
+
+> `LockedProviderId` is set atomically at redirect time using
+> `UPDATE WHERE LockedProviderId IS NULL`. Only one provider can
+> ever hold the lock. `TryConfirmExternalAtomicallyAsync` filters
+> by both `Id` and `LockedProviderId`, so a different provider's
+> callback gets `rows_affected = 0` regardless of `Status`.
 
 ┌─────────────────────────────────────────────────────────────────┐
 │ Balances                                                         │
@@ -1223,6 +1261,20 @@ Redis is **not** used for: outbox messages (must be in the same SQL transaction 
 Redis is preferred over `sp_getapplock` because it does not hold an open SQL Server connection for the lock duration. A SQL connection held for potentially several minutes during a large dispatch run consumes a connection pool slot; if the connection drops, the lock silently releases and another pod may begin a duplicate run. The Redis lease renews on a separate lightweight heartbeat, surviving brief network hiccups, and explicitly detects lock loss to log `LogCritical` and abort safely.
 
 **Warning fallback**: if Redis is unavailable when `TryAcquireAsync` is called, the lock acquisition fails gracefully and logs a warning. The dispatch run proceeds without the lock — the per-license `INSERT WHERE NOT EXISTS` guards still prevent double-billing in this case.
+
+---
+
+### `LockedProviderId` — provider lock at redirect time
+
+**Problem**: The original confirm UPDATE filtered by `ExternalPaymentId` which starts as `NULL`. If `ExternalPaymentId` is not set before the callback arrives (because the bank assigns it during the redirect, not before), the `WHERE` clause matches nothing and the payment stays `Pending` forever. Additionally, nothing prevented a different bank from confirming a payment that was redirected to another bank — either through misconfiguration or a malicious webhook replay.
+
+**Decision**: Two changes made together:
+
+1. The confirm UPDATE now filters by `Id` (always known from the redirect URL) and `LockedProviderId` (set at redirect time), and writes `ExternalPaymentId` and `ProviderId` atomically in the same statement that marks the payment `Paid`. This makes `ExternalPaymentId` a **result** of confirmation, not a prerequisite for it.
+
+2. A `LockedProviderId` column (`nvarchar(50)`, nullable) is set when the user is redirected to a bank, using `UPDATE WHERE LockedProviderId IS NULL` — atomic, idempotent for retries to the same provider, and rejects a second redirect to a different provider with `409 Conflict`. Only the locked provider's confirm callback can win the UPDATE. Any other provider gets `rows_affected = 0`, receives `200 idempotent`, and triggers a `LogWarning` for operational alerting.
+
+The `POST /api/payments/{paymentId}/redirect` endpoint performs the lock before generating the bank redirect URL. It returns `409 Conflict` with `error: "payment_locked_to_other_provider"` if the payment is already locked to a different provider. `LockProviderResult.AlreadyLockedSame` is treated as idempotent success — safe for redirect retries to the same bank.
 
 ---
 

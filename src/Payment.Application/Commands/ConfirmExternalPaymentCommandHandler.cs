@@ -19,14 +19,14 @@ public class ConfirmExternalPaymentCommandHandler
     {
         // Single atomic transaction: flips Pending→Paid (CAS) and writes the
         // PaymentConfirmedEvent outbox entry in one commit — crash-safe.
-        var (confirmed, paymentId) = await _paymentRepo.TryConfirmExternalAtomicallyAsync(
+        var result = await _paymentRepo.TryConfirmExternalAtomicallyAsync(
+            cmd.PaymentId,
             cmd.ExternalPaymentId,
             cmd.ProviderId,
-            cmd.PaidAt,
             ct);
 
-        return confirmed
-            ? new ConfirmExternalPaymentResult(IsAlreadyProcessed: false, PaymentId: paymentId)
-            : new ConfirmExternalPaymentResult(IsAlreadyProcessed: true);
+        return new ConfirmExternalPaymentResult(
+            IsAlreadyProcessed: result.IsAlreadyProcessed,
+            WrongProvider: result.WrongProvider);
     }
 }

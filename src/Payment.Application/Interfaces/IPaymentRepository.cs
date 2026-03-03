@@ -25,10 +25,11 @@ public interface IPaymentRepository
 
     /// <summary>
     /// Atomically: CAS flip Pending→Paid and writes outbox entry in one transaction.
-    /// Returns (false, null) when already processed — fully idempotent.
+    /// Filters by Id + LockedProviderId; sets ExternalPaymentId and ProviderId in
+    /// the same UPDATE that marks the payment Paid.
     /// </summary>
-    Task<(bool Confirmed, Guid? PaymentId)> TryConfirmExternalAtomicallyAsync(
-        string externalPaymentId, string providerId, DateTime paidAt, CancellationToken ct = default);
+    Task<ConfirmResult> TryConfirmExternalAtomicallyAsync(
+        Guid paymentId, string externalPaymentId, string providerId, CancellationToken ct = default);
 
     /// <summary>
     /// Marks a payment as Overdue if it is currently Pending. Idempotent — safe on re-delivery.
@@ -39,6 +40,15 @@ public interface IPaymentRepository
     /// Marks a payment as Failed (e.g. balance race lost after optimistic check).
     /// </summary>
     Task MarkFailedAsync(Guid paymentId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Atomically locks the payment to a provider at redirect time.
+    /// Returns Locked if the lock was set (first redirect).
+    /// Returns AlreadyLockedSame if already locked to this provider — idempotent redirect retry.
+    /// Returns AlreadyLockedOther if locked to a different provider — reject.
+    /// </summary>
+    Task<LockProviderResult> LockProviderAsync(
+        Guid paymentId, string providerId, CancellationToken ct = default);
 }
 
 public enum ProcessBalancePaymentResult
@@ -48,3 +58,12 @@ public enum ProcessBalancePaymentResult
     PaymentNotPending,
     InsufficientBalance
 }
+
+public enum LockProviderResult
+{
+    Locked,            // successfully locked now
+    AlreadyLockedSame, // was already locked to same provider — idempotent, ok
+    AlreadyLockedOther // locked to a different provider — reject
+}
+
+public record ConfirmResult(bool IsAlreadyProcessed, bool WrongProvider);

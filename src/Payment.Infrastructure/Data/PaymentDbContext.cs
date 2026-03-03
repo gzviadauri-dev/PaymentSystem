@@ -30,6 +30,7 @@ public class PaymentDbContext : DbContext
             e.Property(x => x.Status).HasConversion<string>();
             e.Property(x => x.Type).HasConversion<string>();
             e.Property(x => x.Amount).HasPrecision(18, 4);
+            e.Property(x => x.LockedProviderId).HasMaxLength(50);
             e.HasIndex(x => new { x.ExternalPaymentId, x.ProviderId })
              .IsUnique()
              .HasFilter("[ExternalPaymentId] IS NOT NULL");

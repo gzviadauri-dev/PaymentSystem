@@ -1,8 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
-using MediatR;
 using Microsoft.AspNetCore.Mvc;
-using Payment.Application.Commands;
+using Payment.Application.Interfaces;
 
 namespace Payment.API.Endpoints;
 
@@ -13,7 +12,7 @@ public static class ExternalCallbackEndpoints
         app.MapPost("/api/payments/external/confirm", async (
             HttpRequest httpRequest,
             [FromBody] ExternalPaymentConfirmRequest req,
-            IMediator mediator,
+            IPaymentRepository paymentRepository,
             IConfiguration configuration,
             ILogger<Program> logger) =>
         {
@@ -45,17 +44,36 @@ public static class ExternalCallbackEndpoints
             // ────────────────────────────────────────────────────────────────
 
             logger.LogInformation(
-                "External payment callback accepted: ExternalId={ExternalId}, Provider={Provider}",
-                req.ExternalPaymentId, req.ProviderId);
+                "External payment callback accepted: PaymentId={PaymentId}, ExternalId={ExternalId}, Provider={Provider}",
+                req.PaymentId, req.ExternalPaymentId, req.ProviderId);
 
-            var result = await mediator.Send(new ConfirmExternalPaymentCommand(
-                ExternalPaymentId: req.ExternalPaymentId,
-                ProviderId: req.ProviderId,
-                Amount: req.Amount,
-                Currency: req.Currency,
-                PaidAt: req.PaidAt));
+            var result = await paymentRepository.TryConfirmExternalAtomicallyAsync(
+                req.PaymentId, req.ExternalPaymentId, req.ProviderId, httpRequest.HttpContext.RequestAborted);
 
-            return Results.Ok(new { processed = true, idempotent = result.IsAlreadyProcessed });
+            if (result.WrongProvider)
+            {
+                // Return 200 to stop the bank retrying, but log as warning.
+                // The bank is not at fault — this is a system misconfiguration
+                // or a malicious replay. Logging handles the alert.
+                logger.LogWarning(
+                    "Provider {ProviderId} attempted to confirm payment {PaymentId} " +
+                    "which is locked to a different provider. Possible misconfiguration " +
+                    "or malicious replay attempt.",
+                    req.ProviderId, req.PaymentId);
+
+                return Results.Ok(new
+                {
+                    processed = false,
+                    idempotent = true,
+                    reason = "payment_locked_to_other_provider"
+                });
+            }
+
+            return Results.Ok(new
+            {
+                processed = true,
+                idempotent = result.IsAlreadyProcessed
+            });
         })
         .WithName("ExternalPaymentConfirm")
         .WithTags("External")
@@ -92,6 +110,7 @@ public static class ExternalCallbackEndpoints
 }
 
 public record ExternalPaymentConfirmRequest(
+    Guid PaymentId,
     string ExternalPaymentId,
     string ProviderId,
     decimal Amount,

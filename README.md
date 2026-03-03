@@ -25,7 +25,9 @@ This system handles monthly automated billing, real-time external bank callbacks
 | Problem | Mechanism |
 |---|---|
 | Two threads debit the same balance simultaneously | `UPDLOCK + ROWLOCK` on both Balance + Payment in one transaction; `CHECK (Amount >= 0)` as hard backstop |
-| Bank sends the same payment confirmation twice | `UPDATE WHERE Status='Pending'` — atomic CAS; only one writer gets `rows_affected = 1` |
+| Bank sends the same payment confirmation twice | `UPDATE WHERE Id + LockedProviderId + Status='Pending'` — CAS; `ExternalPaymentId` written atomically in the same UPDATE |
+| Bank confirm callback arrives before redirect sets ExternalPaymentId | `ExternalPaymentId` was never a filter — confirm now filters by `Id` + `LockedProviderId`; `ExternalPaymentId` is NULL until the winning UPDATE writes it |
+| Different bank confirms a payment redirected to another bank | `LockedProviderId` set at redirect time via `UPDATE WHERE LockedProviderId IS NULL`; wrong-provider callback gets `rows_affected = 0`, `200 idempotent`, `LogWarning` |
 | Service crashes between DB write and message publish | Transactional outbox — event written in the same commit as the state change |
 | Monthly debt generator restarts mid-run | `INSERT WHERE NOT EXISTS` idempotency guard per `(LicenseId, Month)` |
 | Mobile client retries a timed-out request | `Idempotency-Key` header → Redis `SET NX PX`; 24 h TTL managed by Redis itself |
@@ -190,8 +192,9 @@ dotnet test src/Payment.Tests
 | `POST` | `/api/payments/quick-pay` | JWT | **Preferred**: balance check → create Pending → pay atomically; `Idempotency-Key` required |
 | `POST` | `/api/payments/create` | JWT | `Idempotency-Key` header required |
 | `POST` | `/api/payments/pay-via-balance` | JWT | `Idempotency-Key` header required |
+| `POST` | `/api/payments/{paymentId}/redirect` | JWT | Lock payment to provider before bank redirect; 409 if already locked to different provider |
 | `GET` | `/api/payments/overdue?page&pageSize` | JWT | Payments with `Status=Overdue` |
-| `POST` | `/api/payments/external/confirm` | HMAC | Bank webhook; rate-limited 100/min |
+| `POST` | `/api/payments/external/confirm` | HMAC | Bank webhook; body includes `paymentId`; filters by `Id + LockedProviderId`; rate-limited 100/min |
 | `GET` | `/api/admin/dead-letters` | JWT + `role=admin` | Pending failed outbox messages |
 | `POST` | `/api/admin/dead-letters/{id}/replay` | JWT + `role=admin` | Re-inject; 409 if already Replaying |
 | `GET` | `/health` | — | Liveness (SQL + RabbitMQ + bus topology) |
@@ -211,6 +214,7 @@ dotnet test src/Payment.Tests
 
 - **JWT**: startup throws if key < 32 chars or matches known weak placeholder values
 - **Webhook**: HMAC-SHA256 `X-Provider-Signature` with constant-time comparison; rate-limited to 100 req/min
+- **Provider lock**: `LockedProviderId` set at redirect time via atomic `UPDATE WHERE LockedProviderId IS NULL`; only the locked provider's callback can confirm; wrong-provider returns 200 idempotent + `LogWarning`
 - **CORS**: production rejects non-`https://` origins at startup
 - **Admin endpoints**: require `role=admin` JWT claim
 - **Idempotency**: Redis `SET NX` claims slot before command executes; concurrent callers see Processing → 409 + `Retry-After: 2`; crashed slots auto-recover after 30 s; Redis unavailability returns 503 (never bypasses the guard)

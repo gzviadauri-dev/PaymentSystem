@@ -11,8 +11,17 @@ public class Payment
     public PaymentType Type { get; set; }
     public string? ExternalPaymentId { get; set; }
     public string? ProviderId { get; set; }
+    public string? LockedProviderId { get; private set; }
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public DateTime? PaidAt { get; set; }
     public DateTime? Month { get; set; }
     public Guid? TargetId { get; set; }
+
+    public void LockProvider(string providerId)
+    {
+        if (LockedProviderId != null)
+            throw new InvalidOperationException(
+                $"Payment {Id} is already locked to provider {LockedProviderId}.");
+        LockedProviderId = providerId;
+    }
 }
